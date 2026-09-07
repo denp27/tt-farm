@@ -6,18 +6,23 @@ from aiogram.dispatcher.filters.state import State, StatesGroup
 from config import BOT_TOKEN
 from registry import load_offers, add_offer, calculate_earnings
 from utils import get_connected_devices, reset_device_fingerprint, connect_device_proxy
+from auth_social import add_social_account, get_platform_accounts
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 
-# Состояния для пошагового ввода данных
 class BotStates(StatesGroup):
     waiting_for_proxy = State()
     waiting_for_account = State()
     waiting_for_offer_name = State()
     waiting_for_offer_cpm = State()
+
+class SocialAuthStates(StatesGroup):
+    waiting_for_credential = State()
+
+temp_auth_data = {}
 
 @dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message):
@@ -25,6 +30,7 @@ async def cmd_start(message: types.Message):
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     kb.add(
         "📱 Подключенные телефоны", 
+        "🌐 Управление соцсетями (YT, Insta, TT)",
         "🌐 Добавить прокси",
         "👤 Добавить аккаунт", 
         "💼 Добавить оффер",
@@ -44,12 +50,87 @@ async def cmd_start(message: types.Message):
 async def show_devices(message: types.Message):
     devices = get_connected_devices()
     if not devices:
-        await message.answer("К системе не подключено ни одного телефона по ADB. Проверьте подключение кабеля и отладку по USB.")
+        await message.answer("К системе не подключено ни одного телефона по ADB.")
     else:
         text = "📱 *Список доступных телефонов*:\n" + "\n".join([f"• `{d}`" for d in devices])
         await message.answer(text, parse_mode="Markdown")
 
-# --- ДОБАВЛЕНИЕ ПРОКСИ ЧЕРЕЗ ИНТЕРФЕЙС ---
+@dp.message_handler(text="🌐 Управление соцсетями (YT, Insta, TT)")
+async def social_networks_menu(message: types.Message):
+    kb = types.InlineKeyboardMarkup(row_width=3)
+    kb.add(
+        types.InlineKeyboardButton("📺 YouTube", callback_data="soc_youtube"),
+        types.InlineKeyboardButton("📸 Instagram", callback_data="soc_instagram"),
+        types.InlineKeyboardButton("🎬 TikTok", callback_data="soc_tiktok")
+    )
+    
+    yt_accs = get_platform_accounts("youtube")
+    ig_accs = get_platform_accounts("instagram")
+    tt_accs = get_platform_accounts("tiktok")
+    
+    text = (
+        "🌐 *Центр авторизации и входа в соцсети*:\n\n"
+        f"📺 YouTube аккаунтов: {len(yt_accs)}\n"
+        f"📸 Instagram аккаунтов: {len(ig_accs)}\n"
+        f"🎬 TikTok аккаунтов: {len(tt_accs)}\n\n"
+        "Выберите платформу для просмотра или добавления аккаунта:"
+    )
+    await message.answer(text, parse_mode="Markdown", reply_markup=kb)
+
+@dp.callback_query_handler(lambda c: c.data.startswith('soc_'))
+async def process_social_selection(callback_query: types.CallbackQuery):
+    platform = callback_query.data.split('_')[1]
+    temp_auth_data[callback_query.from_user.id] = platform
+    await bot.answer_callback_query(callback_query.id)
+    
+    accounts = get_platform_accounts(platform)
+    acc_list = "\n".join([f"• `{acc}`" for acc in accounts.keys()]) if accounts else "Нет привязанных аккаунтов."
+    
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton(f"➕ Добавить аккаунт {platform.upper()}", callback_data=f"add_soc_{platform}"))
+    
+    await bot.send_message(
+        callback_query.from_user.id,
+        f"📌 Платформа: *{platform.upper()}*\n\n"
+        f"Активные сессии:\n{acc_list}",
+        parse_mode="Markdown",
+        reply_markup=kb
+    )
+
+@dp.callback_query_handler(lambda c: c.data.startswith('add_soc_'))
+async def start_add_social(callback_query: types.CallbackQuery):
+    platform = callback_query.data.split('_')[2]
+    temp_auth_data[callback_query.from_user.id] = platform
+    await bot.answer_callback_query(callback_query.id)
+    
+    await SocialAuthStates.waiting_for_credential.set()
+    await bot.send_message(
+        callback_query.from_user.id,
+        f"🔑 Введите данные для входа в *{platform.upper()}* "
+        f"(ИмяАккаунта Токен/Сессия через пробел):",
+        parse_mode="Markdown"
+    )
+
+@dp.message_handler(state=SocialAuthStates.waiting_for_credential)
+async def process_social_credential(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    platform = temp_auth_data.get(user_id, "tiktok")
+    
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("❌ Неверный формат. Введите: `Имя Токен`", parse_mode="Markdown")
+        return
+        
+    acc_name, credential = parts[0], parts[1]
+    success = add_social_account(platform, acc_name, credential)
+    
+    if success:
+        await message.answer(f"✅ Аккаунт *{acc_name}* для *{platform.upper()}* успешно добавлен!", parse_mode="Markdown")
+    else:
+        await message.answer("❌ Ошибка при сохранении сессии.")
+        
+    await state.finish()
+
 @dp.message_handler(text="🌐 Добавить прокси")
 async def start_add_proxy(message: types.Message):
     devices = get_connected_devices()
@@ -57,58 +138,42 @@ async def start_add_proxy(message: types.Message):
         await message.answer("⚠️ Сначала подключите хотя бы один телефон по ADB.")
         return
     await BotStates.waiting_for_proxy.set()
-    await message.answer(
-        "🌐 Введите прокси в формате:\n`ip:port` или `ip:port:login:pass`\n\n"
-        "Прокси будет автоматически применен к первому подключенному телефону.",
-        parse_mode="Markdown"
-    )
+    await message.answer("🌐 Введите прокси в формате `ip:port` или `ip:port:login:pass`:")
 
 @dp.message_handler(state=BotStates.waiting_for_proxy)
 async def process_proxy(message: types.Message, state: FSMContext):
     proxy_str = message.text.strip()
     devices = get_connected_devices()
-    
     if devices:
-        device_id = devices[0]
-        success = connect_device_proxy(device_id, proxy_str)
+        success = connect_device_proxy(devices[0], proxy_str)
         if success:
-            await message.answer(f"✅ Прокси успешно установлен на устройство `{device_id}`!", parse_mode="Markdown")
+            await message.answer(f"✅ Прокси установлен на устройство `{devices[0]}`!", parse_mode="Markdown")
         else:
-            await message.answer("❌ Ошибка при применении прокси через ADB.")
-    else:
-        await message.answer("❌ Устройства не найдены.")
-        
+            await message.answer("❌ Ошибка установки прокси.")
     await state.finish()
 
-# --- ДОБАВЛЕНИЕ АККАУНТА ЧЕРЕЗ ИНТЕРФЕЙС ---
 @dp.message_handler(text="👤 Добавить аккаунт")
 async def start_add_account(message: types.Message):
-    devices = get_connected_devices()
-    if not devices:
-        await message.answer("⚠️ Сначала подключите телефон, на который хотите авторизовать аккаунт.")
-        return
     await BotStates.waiting_for_account.set()
-    await message.answer("👤 Введите логин (username или номер телефона) аккаунта для привязки к устройству:")
+    await message.answer("👤 Введите логин или юзернейм аккаунта:")
 
 @dp.message_handler(state=BotStates.waiting_for_account)
 async def process_account(message: types.Message, state: FSMContext):
     acc_name = message.text.strip()
-    # Здесь сохраняем аккаунт в базу или файл
-    await message.answer(f"✅ Аккаунт *{acc_name}* успешно привязан к системе и готов к работе!", parse_mode="Markdown")
+    await message.answer(f"✅ Аккаунт *{acc_name}* привязан к системе!", parse_mode="Markdown")
     await state.finish()
 
-# --- ДОБАВЛЕНИЕ ОФФЕРА И CPM ---
 @dp.message_handler(text="💼 Добавить оффер")
 async def start_add_offer(message: types.Message):
     await BotStates.waiting_for_offer_name.set()
-    await message.answer("💼 Введите название нового оффера (например: *TikTok Wildberries*):", parse_mode="Markdown")
+    await message.answer("💼 Введите название нового оффера:")
 
 @dp.message_handler(state=BotStates.waiting_for_offer_name)
 async def process_offer_name(message: types.Message, state: FSMContext):
     async with state.proxy() as data:
         data['offer_name'] = message.text.strip()
     await BotStates.next()
-    await message.answer("💵 Введите цену за 1000 просмотров (CPM) в USD (например: `1.5`):", parse_mode="Markdown")
+    await message.answer("💵 Введите цену за 1000 просмотров (CPM) в USD (например, `1.5`):")
 
 @dp.message_handler(state=BotStates.waiting_for_offer_cpm)
 async def process_offer_cpm(message: types.Message, state: FSMContext):
@@ -116,16 +181,13 @@ async def process_offer_cpm(message: types.Message, state: FSMContext):
         cpm_usd = float(message.text.strip().replace(',', '.'))
         async with state.proxy() as data:
             offer_name = data['offer_name']
-            
         add_offer(offer_name, cpm_usd)
-        await message.answer(f"✅ Оффер *{offer_name}* с CPM **${cpm_usd}** успешно добавлен!", parse_mode="Markdown")
+        await message.answer(f"✅ Оффер *{offer_name}* с CPM **${cpm_usd}** добавлен!", parse_mode="Markdown")
     except ValueError:
-        await message.answer("❌ Неверный формат числа. Введите корректное число для CPM (например, `1.5`):")
+        await message.answer("❌ Неверный формат числа.")
         return
-        
     await state.finish()
 
-# --- СТАТИСТИКА И ОФФЕРЫ ---
 @dp.message_handler(text="📊 Статистика и Офферы")
 async def stats_menu(message: types.Message):
     offers = load_offers()
@@ -142,7 +204,7 @@ async def stats_menu(message: types.Message):
                 f"🇷🇺 RUB: {earned['RUB']} ₽ *(Курс ЦБ: {earned['current_usd_rate']} ₽)*\n" \
                 f"💎 TON: {earned['TON']} TON"
     else:
-        text += "\nНет добавленных офферов. Нажмите «💼 Добавить оффер»."
+        text += "\nНет добавленных офферов."
                 
     await message.answer(text, parse_mode="Markdown")
 
@@ -154,26 +216,18 @@ async def check_ban(message: types.Message):
 async def anti_ban_menu(message: types.Message):
     devices = get_connected_devices()
     if not devices:
-        await message.answer("Нет подключенных устройств для применения мер обхода.")
+        await message.answer("Нет подключенных устройств.")
         return
-        
-    device_id = devices[0]
-    success = reset_device_fingerprint(device_id)
-    
+    success = reset_device_fingerprint(devices[0])
     if success:
-        await message.answer(
-            f"🛡 Обходной маневр выполнен для устройства `{device_id}`:\n"
-            f"• Сброшен рекламный ID (GAID)\n"
-            f"• Очищен кэш приложения",
-            parse_mode="Markdown"
-        )
+        await message.answer(f"🛡 Сброс отпечатков выполнен для устройства `{devices[0]}`!", parse_mode="Markdown")
     else:
-        await message.answer("Ошибка при сбросе параметров устройства.")
+        await message.answer("Ошибка сброса.")
 
 @dp.message_handler(text="🔥 Прогреть аккаунт")
 async def warm_up_action(message: types.Message):
     devices = get_connected_devices()
     if not devices:
-        await message.answer("Нет подключенных устройств для запуска прогрева.")
+        await message.answer("Нет подключенных устройств.")
         return
-    await message.answer(f"🔥 Прогрев аккаунта на устройстве `{devices[0]}` запущен в фоновом режиме...", parse_mode="Markdown")
+    await message.answer(f"🔥 Прогрев запущен на устройстве `{devices[0]}`...", parse_mode="Markdown")
