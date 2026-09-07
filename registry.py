@@ -22,10 +22,10 @@ def add_offer(offer_name: str, cpm_usd: float):
     save_offers(offers)
 
 def calculate_earnings(views: int, cpm_usd: float):
-    """Рассчитывает доход, подтягивая актуальный курс ЦБ РФ"""
+    """Рассчитывает доход в USD, RUB (по курсу ЦБ) и TON"""
     rates = get_cb_rates()
     usd_rate = rates.get("USD", 95.0)
-    ton_rate = 5.5  # Курс TON (можно привязать к API криптобирж при необходимости)
+    ton_rate = 5.5
     
     total_usd = (views / 1000.0) * cpm_usd
     total_rub = total_usd * usd_rate
